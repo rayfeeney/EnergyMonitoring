@@ -1,0 +1,5 @@
+[project]
+name = "EnergyMonitoring"
+version = "0.1.0"
+description = "Home energy monitoring using Enphase, Tapo and OrchidApp data"
+requires-python = ">=3.11"
