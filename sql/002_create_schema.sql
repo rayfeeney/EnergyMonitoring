@@ -1,4 +1,5 @@
-USE EnergyMonitoring;
+USE energymonitoring;
+
 
 CREATE TABLE IF NOT EXISTS TapoDevice
 (
@@ -6,18 +7,19 @@ CREATE TABLE IF NOT EXISTS TapoDevice
     DeviceName VARCHAR(100) NOT NULL,
     Model VARCHAR(20) NOT NULL,
     IpAddress VARCHAR(45) NULL,
-    IsActive BOOLEAN NOT NULL DEFAULT TRUE,
-    CreatedUtc DATETIME NOT NULL DEFAULT UTC_TIMESTAMP(),
+    IsActive TINYINT(1) NOT NULL DEFAULT 1,
+    CreatedUtc DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
 
     PRIMARY KEY (TapoDeviceKey)
 );
+
 
 CREATE TABLE IF NOT EXISTS TapoEnergyHourly
 (
     TapoDeviceKey INT NOT NULL,
     HourStartUtc DATETIME NOT NULL,
     EnergyWh INT NOT NULL,
-    LoadedUtc DATETIME NOT NULL DEFAULT UTC_TIMESTAMP(),
+    LoadedUtc DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
 
     PRIMARY KEY
     (
@@ -25,17 +27,17 @@ CREATE TABLE IF NOT EXISTS TapoEnergyHourly
         HourStartUtc
     ),
 
-    CONSTRAINT FK_TapoEnergyHourly_TapoDevice
-        FOREIGN KEY (TapoDeviceKey)
-        REFERENCES TapoDevice(TapoDeviceKey)
+    FOREIGN KEY (TapoDeviceKey)
+        REFERENCES TapoDevice (TapoDeviceKey)
 );
+
 
 CREATE TABLE IF NOT EXISTS TapoPowerReading
 (
     TapoDeviceKey INT NOT NULL,
     ReadingUtc DATETIME NOT NULL,
     PowerWatts INT NOT NULL,
-    LoadedUtc DATETIME NOT NULL DEFAULT UTC_TIMESTAMP(),
+    LoadedUtc DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
 
     PRIMARY KEY
     (
@@ -43,10 +45,10 @@ CREATE TABLE IF NOT EXISTS TapoPowerReading
         ReadingUtc
     ),
 
-    CONSTRAINT FK_TapoPowerReading_TapoDevice
-        FOREIGN KEY (TapoDeviceKey)
-        REFERENCES TapoDevice(TapoDeviceKey)
+    FOREIGN KEY (TapoDeviceKey)
+        REFERENCES TapoDevice (TapoDeviceKey)
 );
+
 
 CREATE TABLE IF NOT EXISTS EnphaseInterval
 (
@@ -55,10 +57,11 @@ CREATE TABLE IF NOT EXISTS EnphaseInterval
     ConsumedWh INT NULL,
     ImportedWh INT NULL,
     ExportedWh INT NULL,
-    LoadedUtc DATETIME NOT NULL DEFAULT UTC_TIMESTAMP(),
+    LoadedUtc DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
 
     PRIMARY KEY (IntervalEndUtc)
 );
+
 
 CREATE TABLE IF NOT EXISTS LoadRun
 (
