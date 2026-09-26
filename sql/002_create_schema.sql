@@ -1,4 +1,4 @@
-USE energymonitoring;
+USE EnergyMonitoring;
 
 
 CREATE TABLE IF NOT EXISTS TapoDevice
