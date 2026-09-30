@@ -13,7 +13,7 @@ OPEN_METEO_URL = "https://archive-api.open-meteo.com/v1/archive"
 
 WEATHER_START_DATE = datetime(2026, 9, 25, tzinfo=timezone.utc).date()
 
-REANALYSIS_LOOKBACK_DAYS = 10
+WEATHER_RELOAD_DAYS = 10
 
 HOURLY_VARIABLES = [
     "temperature_2m",
@@ -27,6 +27,49 @@ HOURLY_VARIABLES = [
 ]
 
 
+def start_load_run(cursor, source_name: str) -> int:
+    cursor.execute(
+        """
+        INSERT INTO LoadRun
+        (
+            SourceName,
+            StartedUtc,
+            Status
+        )
+        VALUES (%s, UTC_TIMESTAMP(), 'Running')
+        """,
+        (source_name,),
+    )
+
+    return cursor.lastrowid
+
+
+def complete_load_run(
+    cursor,
+    load_run_key: int,
+    rows_received: int,
+    rows_inserted: int,
+    rows_updated: int,
+):
+    cursor.execute(
+        """
+        UPDATE LoadRun
+        SET CompletedUtc = UTC_TIMESTAMP(),
+            RowsReceived = %s,
+            RowsInserted = %s,
+            RowsUpdated = %s,
+            Status = 'Succeeded'
+        WHERE LoadRunKey = %s
+        """,
+        (
+            rows_received,
+            rows_inserted,
+            rows_updated,
+            load_run_key,
+        ),
+    )
+
+    
 def get_weather_date_range(connection):
     with connection.cursor() as cursor:
         cursor.execute(
@@ -100,15 +143,12 @@ def get_recent_weather(connection):
 
     now_utc = datetime.now(timezone.utc)
 
-    earliest_interval, latest_interval = get_weather_date_range(connection)
+    first_missing_interval = get_first_missing_weather_interval(connection)
 
-    if (
-        earliest_interval is None
-        or earliest_interval.date() > WEATHER_START_DATE
-    ):
-        start_date = WEATHER_START_DATE
+    if first_missing_interval is not None:
+        start_date = first_missing_interval.date()
     else:
-        start_date = (latest_interval - timedelta(days=2)).date()
+        start_date = (now_utc - timedelta(days=WEATHER_RELOAD_DAYS)).date()
 
         if start_date < WEATHER_START_DATE:
             start_date = WEATHER_START_DATE
@@ -135,13 +175,25 @@ def get_recent_weather(connection):
     return response.json()
 
 
-def get_reanalysis_weather():
+def get_reanalysis_weather(connection):
     latitude = float(os.environ["WEATHER_LATITUDE"])
     longitude = float(os.environ["WEATHER_LONGITUDE"])
 
     now_utc = datetime.now(timezone.utc)
 
-    start_date = (now_utc - timedelta(days=REANALYSIS_LOOKBACK_DAYS)).date()
+    earliest_recent_interval = get_earliest_recent_interval(connection)
+
+    normal_start_date = (
+        now_utc - timedelta(days=WEATHER_RELOAD_DAYS)
+    ).date()
+
+    if earliest_recent_interval is not None:
+        start_date = min(
+            earliest_recent_interval.date(),
+            normal_start_date,
+        )
+    else:
+        start_date = normal_start_date
 
     if start_date < WEATHER_START_DATE:
         start_date = WEATHER_START_DATE
@@ -198,6 +250,46 @@ def build_weather_rows(weather):
                 "WindGustKmh": hourly["wind_gusts_10m"][index],
                 "ShortwaveRadiationWm2": hourly["shortwave_radiation"][index],
                 "DirectRadiationWm2": hourly["direct_radiation"][index],
+            }
+        )
+
+    return rows
+
+
+def build_reanalysis_rows(weather):
+    hourly = weather["hourly"]
+
+    rows = []
+
+    for index, time_value in enumerate(hourly["time"]):
+        values = [
+            hourly["temperature_2m"][index],
+            hourly["relative_humidity_2m"][index],
+            hourly["precipitation"][index],
+            hourly["cloud_cover"][index],
+            hourly["wind_speed_10m"][index],
+            hourly["wind_gusts_10m"][index],
+            hourly["shortwave_radiation"][index],
+            hourly["direct_radiation"][index],
+        ]
+
+        # Do not allow incomplete Reanalysis data to replace Recent data.
+        if any(value is None for value in values):
+            continue
+
+        rows.append(
+            {
+                "IntervalStartUtc": datetime.fromisoformat(time_value).replace(
+                    tzinfo=timezone.utc
+                ),
+                "TemperatureC": values[0],
+                "RelativeHumidityPct": values[1],
+                "PrecipitationMm": values[2],
+                "CloudCoverPct": values[3],
+                "WindSpeedKmh": values[4],
+                "WindGustKmh": values[5],
+                "ShortwaveRadiationWm2": values[6],
+                "DirectRadiationWm2": values[7],
             }
         )
 
@@ -288,34 +380,82 @@ def upsert_recent_weather(connection, rows):
     connection.commit()
 
 
+def upsert_reanalysis_weather(connection, rows):
+    if not rows:
+        return
+
+    sql = """
+        INSERT INTO WeatherHourly
+        (
+            IntervalStartUtc,
+            TemperatureC,
+            RelativeHumidityPct,
+            PrecipitationMm,
+            CloudCoverPct,
+            WindSpeedKmh,
+            WindGustKmh,
+            ShortwaveRadiationWm2,
+            DirectRadiationWm2,
+            WeatherDataType
+        )
+        VALUES
+        (
+            %s, %s, %s, %s, %s,
+            %s, %s, %s, %s, 'Reanalysis'
+        )
+        ON DUPLICATE KEY UPDATE
+            TemperatureC = VALUES(TemperatureC),
+            RelativeHumidityPct = VALUES(RelativeHumidityPct),
+            PrecipitationMm = VALUES(PrecipitationMm),
+            CloudCoverPct = VALUES(CloudCoverPct),
+            WindSpeedKmh = VALUES(WindSpeedKmh),
+            WindGustKmh = VALUES(WindGustKmh),
+            ShortwaveRadiationWm2 = VALUES(ShortwaveRadiationWm2),
+            DirectRadiationWm2 = VALUES(DirectRadiationWm2),
+            WeatherDataType = 'Reanalysis',
+            LoadedAtUtc = UTC_TIMESTAMP()
+    """
+
+    values = [
+        (
+            row["IntervalStartUtc"].replace(tzinfo=None),
+            row["TemperatureC"],
+            row["RelativeHumidityPct"],
+            row["PrecipitationMm"],
+            row["CloudCoverPct"],
+            row["WindSpeedKmh"],
+            row["WindGustKmh"],
+            row["ShortwaveRadiationWm2"],
+            row["DirectRadiationWm2"],
+        )
+        for row in rows
+    ]
+
+    with connection.cursor() as cursor:
+        cursor.executemany(sql, values)
+
+    connection.commit()
+
+
 def main():
     connection = get_database_connection()
 
+    load_run_key = None
+
     first_missing_interval = get_first_missing_weather_interval(connection)
 
-    print(f"First missing weather interval: {first_missing_interval}")
+    #print(f"First missing weather interval: {first_missing_interval}")
     
     try:
+        with connection.cursor() as cursor:
+            load_run_key = start_load_run(cursor, "Weather")
+
+        connection.commit()
+
         weather = get_recent_weather(connection)
-        reanalysis_weather = get_reanalysis_weather()
+        reanalysis_weather = get_reanalysis_weather(connection)
 
-        reanalysis_times = reanalysis_weather["hourly"]["time"]
-        reanalysis_temperatures = reanalysis_weather["hourly"]["temperature_2m"]
-
-        available_reanalysis = [
-            time_value
-            for time_value, temperature
-            in zip(reanalysis_times, reanalysis_temperatures)
-            if temperature is not None
-        ]
-
-        print()
-        print(f"Reanalysis rows received: {len(reanalysis_times)}")
-        print(f"Reanalysis rows available: {len(available_reanalysis)}")
-
-        if available_reanalysis:
-            print(f"First available reanalysis: {available_reanalysis[0]}")
-            print(f"Last available reanalysis: {available_reanalysis[-1]}")
+        reanalysis_rows = build_reanalysis_rows(reanalysis_weather)
 
         hourly = weather["hourly"]
         times = hourly["time"]
@@ -333,36 +473,74 @@ def main():
             < current_hour_utc
         ]
 
-        print(f"Weather rows received: {len(times)}")
-        print(f"Completed weather rows: {len(completed_times)}")
-        print(f"First interval: {times[0]}")
-        print(f"Last completed interval: {completed_times[-1]}")
+        #print(f"Weather rows received: {len(times)}")
+        #print(f"Completed weather rows: {len(completed_times)}")
+        #print(f"First interval: {times[0]}")
+        #print(f"Last completed interval: {completed_times[-1]}")
 
-        print()
-        print("Units:")
-        for name, unit in weather["hourly_units"].items():
-            print(f"  {name}: {unit}")
+        #print()
+        #print("Units:")
+        #for name, unit in weather["hourly_units"].items():
+        #    print(f"  {name}: {unit}")
 
         rows = build_weather_rows(weather)
 
-        print()
-        print(f"Weather rows built: {len(rows)}")
-        print("First row:")
-        print(rows[0])
-        print()
-        print("Last row:")
-        print(rows[-1])
+        #print()
+        #print(f"Weather rows built: {len(rows)}")
+        #print("First row:")
+        #print(rows[0])
+        #print()
+        #print("Last row:")
+        #print(rows[-1])
 
         with connection.cursor() as cursor:
             cursor.execute("SELECT DATABASE()")
             database_name = cursor.fetchone()[0]
 
-        print()
-        print(f"Database connection successful: {database_name}")
+        #print()
+        #print(f"Database connection successful: {database_name}")
 
         upsert_recent_weather(connection, rows)
 
         print(f"Recent weather rows processed: {len(rows)}")
+
+        upsert_reanalysis_weather(connection, reanalysis_rows)
+
+        print(f"Reanalysis weather rows processed: {len(reanalysis_rows)}")
+
+        with connection.cursor() as cursor:
+            complete_load_run(
+                cursor,
+                load_run_key,
+                len(rows) + len(reanalysis_rows),
+                0,
+                0,
+            )
+
+        connection.commit()
+
+    except Exception as exc:
+        connection.rollback()
+
+        if load_run_key is not None:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    UPDATE LoadRun
+                    SET CompletedUtc = UTC_TIMESTAMP(),
+                        Status = 'Failed',
+                        ErrorMessage = %s
+                    WHERE LoadRunKey = %s
+                    """,
+                    (
+                        str(exc),
+                        load_run_key,
+                    ),
+                )
+
+            connection.commit()
+
+        raise
 
     finally:
         connection.close()
