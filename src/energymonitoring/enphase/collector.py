@@ -3,6 +3,8 @@ import base64
 import urllib.parse
 import urllib.request
 import json
+import argparse
+import time
 
 from dotenv import load_dotenv, set_key
 from datetime import datetime, timedelta, timezone
@@ -139,6 +141,31 @@ def get_export_intervals(
         return json.loads(response.read().decode("utf-8"))
 
 
+def get_battery_intervals(
+    system_id: str,
+    api_key: str,
+    access_token: str,
+    start_at: int,
+    end_at: int,
+):
+    url = (
+        f"https://api.enphaseenergy.com/api/v4/systems/"
+        f"{system_id}/telemetry/battery"
+        f"?key={api_key}&start_at={start_at}&end_at={end_at}"
+    )
+
+    request = urllib.request.Request(
+        url,
+        method="GET",
+        headers={
+            "Authorization": f"Bearer {access_token}",
+        },
+    )
+
+    with urllib.request.urlopen(request) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
 def start_load_run(cursor, source_name: str) -> int:
     cursor.execute(
         """
@@ -183,6 +210,22 @@ def complete_load_run(
 
 
 def main():
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument(
+        "--start-date",
+        type=str,
+        help="Historical backfill start date in YYYY-MM-DD format.",
+    )
+
+    parser.add_argument(
+        "--end-date",
+        type=str,
+        help="Historical backfill end date in YYYY-MM-DD format.",
+    )
+
+    args = parser.parse_args()
+
     load_dotenv()
 
     system_id = os.environ["ENPHASE_SYSTEM_ID"]
@@ -201,70 +244,133 @@ def main():
         "ENPHASE_REFRESH_TOKEN",
         new_refresh_token,
     )
+    if bool(args.start_date) != bool(args.end_date):
+        parser.error(
+            "--start-date and --end-date must be supplied together."
+        )
 
-    end_time = datetime.now(timezone.utc).replace(
-        minute=0,
-        second=0,
-        microsecond=0,
-    )
+    if args.start_date and args.end_date:
+        start_time = datetime.strptime(
+            args.start_date,
+            "%Y-%m-%d",
+        ).replace(tzinfo=timezone.utc)
 
-    start_time = end_time - timedelta(days=1)
+        end_time = datetime.strptime(
+            args.end_date,
+            "%Y-%m-%d",
+        ).replace(tzinfo=timezone.utc)
 
-    production = get_production_intervals(
-        system_id,
-        api_key,
-        access_token,
-        int(start_time.timestamp()),
-        int(end_time.timestamp()),
-    )
+        if end_time <= start_time:
+            parser.error(
+                "--end-date must be later than --start-date."
+            )
 
-    intervals = production.get("intervals", [])
+        chunk_days = 1
+
+    else:
+        end_time = datetime.now(timezone.utc).replace(
+            minute=0,
+            second=0,
+            microsecond=0,
+        )
+
+        start_time = end_time - timedelta(days=1)
+        chunk_days = 1
+
+    intervals = []
+    consumption_intervals = []
+    import_intervals = []
+    export_intervals = []
+    battery_intervals = []
+
+    chunk_start = start_time
+
+    while chunk_start < end_time:
+        chunk_end = min(
+            chunk_start + timedelta(days=chunk_days),
+            end_time,
+        )
+
+        print(
+            f"Retrieving Enphase data "
+            f"{chunk_start.isoformat()} to {chunk_end.isoformat()}"
+        )
+
+        production = get_production_intervals(
+            system_id,
+            api_key,
+            access_token,
+            int(chunk_start.timestamp()),
+            int(chunk_end.timestamp()),
+        )
+
+        intervals.extend(
+            production.get("intervals", [])
+        )
+
+        consumption = get_consumption_intervals(
+            system_id,
+            api_key,
+            access_token,
+            int(chunk_start.timestamp()),
+            int(chunk_end.timestamp()),
+        )
+
+        consumption_intervals.extend(
+            consumption.get("intervals", [])
+        )
+
+        grid_import = get_import_intervals(
+            system_id,
+            api_key,
+            access_token,
+            int(chunk_start.timestamp()),
+            int(chunk_end.timestamp()),
+        )
+
+        import_intervals.extend(
+            interval
+            for group in grid_import.get("intervals", [])
+            for interval in group
+        )
+
+        grid_export = get_export_intervals(
+            system_id,
+            api_key,
+            access_token,
+            int(chunk_start.timestamp()),
+            int(chunk_end.timestamp()),
+        )
+
+        export_intervals.extend(
+            interval
+            for group in grid_export.get("intervals", [])
+            for interval in group
+        )
+
+        battery = get_battery_intervals(
+            system_id,
+            api_key,
+            access_token,
+            int(chunk_start.timestamp()),
+            int(chunk_end.timestamp()),
+        )
+
+        battery_intervals.extend(
+            battery.get("intervals", [])
+        )
+
+        chunk_start = chunk_end
+
+        if chunk_start < end_time:
+            print("Waiting 60 seconds before next Enphase API batch...")
+            time.sleep(60)
 
     print(f"Production intervals received: {len(intervals)}")
-
-    consumption = get_consumption_intervals(
-        system_id,
-        api_key,
-        access_token,
-        int(start_time.timestamp()),
-        int(end_time.timestamp()),
-    )
-
-    consumption_intervals = consumption.get("intervals", [])
-
     print(f"Consumption intervals received: {len(consumption_intervals)}")
-
-    grid_import = get_import_intervals(
-        system_id,
-        api_key,
-        access_token,
-        int(start_time.timestamp()),
-        int(end_time.timestamp()),
-    )
-
-    import_intervals = [
-        interval
-        for group in grid_import.get("intervals", [])
-        for interval in group
-    ]
-
     print(f"Import intervals received: {len(import_intervals)}")
-
-    grid_export = get_export_intervals(
-        system_id,
-        api_key,
-        access_token,
-        int(start_time.timestamp()),
-        int(end_time.timestamp()),
-    )
-
-    export_intervals = [
-        interval
-        for group in grid_export.get("intervals", [])
-        for interval in group
-    ]
-
     print(f"Export intervals received: {len(export_intervals)}")
+    print(f"Battery intervals received: {len(battery_intervals)}")
 
     combined_intervals = {}
 
@@ -279,6 +385,19 @@ def main():
 
     for row in export_intervals:
         combined_intervals.setdefault(row["end_at"], {})["ExportedWh"] = row["wh_exported"]
+
+    for row in battery_intervals:
+        end_at = row["end_at"]
+
+        combined_intervals.setdefault(end_at, {})["ChargedWh"] = (
+            row.get("charge", {}).get("enwh")
+        )
+        combined_intervals.setdefault(end_at, {})["DischargedWh"] = (
+            row.get("discharge", {}).get("enwh")
+        )
+        combined_intervals.setdefault(end_at, {})["BatterySocPct"] = (
+            row.get("soc", {}).get("percent")
+        )
 
     print(f"Combined intervals: {len(combined_intervals)}")
 
@@ -318,9 +437,12 @@ def main():
                         ProducedWh,
                         ConsumedWh,
                         ImportedWh,
-                        ExportedWh
+                        ExportedWh,
+                        ChargedWh,
+                        DischargedWh,
+                        BatterySocPct
                     )
-                    VALUES (%s, %s, %s, %s, %s)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
 
                     ON DUPLICATE KEY UPDATE
                         LoadedUtc = IF(
@@ -329,6 +451,9 @@ def main():
                                 AND ConsumedWh <=> VALUES(ConsumedWh)
                                 AND ImportedWh <=> VALUES(ImportedWh)
                                 AND ExportedWh <=> VALUES(ExportedWh)
+                                AND ChargedWh <=> VALUES(ChargedWh)
+                                AND DischargedWh <=> VALUES(DischargedWh)
+                                AND BatterySocPct <=> VALUES(BatterySocPct)
                             ),
                             CURRENT_TIMESTAMP,
                             LoadedUtc
@@ -336,7 +461,10 @@ def main():
                         ProducedWh = VALUES(ProducedWh),
                         ConsumedWh = VALUES(ConsumedWh),
                         ImportedWh = VALUES(ImportedWh),
-                        ExportedWh = VALUES(ExportedWh)
+                        ExportedWh = VALUES(ExportedWh),
+                        ChargedWh = VALUES(ChargedWh),
+                        DischargedWh = VALUES(DischargedWh),
+                        BatterySocPct = VALUES(BatterySocPct)
                     """,
                     (
                         interval_end_utc,
@@ -344,6 +472,9 @@ def main():
                         values.get("ConsumedWh"),
                         values.get("ImportedWh"),
                         values.get("ExportedWh"),
+                        values.get("ChargedWh"),
+                        values.get("DischargedWh"),
+                        values.get("BatterySocPct"),
                     ),
                 )
 
