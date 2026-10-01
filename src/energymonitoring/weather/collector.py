@@ -69,20 +69,6 @@ def complete_load_run(
         ),
     )
 
-    
-def get_weather_date_range(connection):
-    with connection.cursor() as cursor:
-        cursor.execute(
-            """
-            SELECT
-                MIN(IntervalStartUtc),
-                MAX(IntervalStartUtc)
-            FROM WeatherHourly
-            """
-        )
-
-        return cursor.fetchone()
-
 
 def get_first_missing_weather_interval(connection):
     start_datetime = datetime.combine(
@@ -121,7 +107,14 @@ def get_first_missing_weather_interval(connection):
             ),
         )
 
-        return cursor.fetchone()[0]
+        first_missing_interval = cursor.fetchone()[0]
+
+        if isinstance(first_missing_interval, str):
+            first_missing_interval = datetime.fromisoformat(
+                first_missing_interval
+            )
+
+        return first_missing_interval
 
     
 def get_earliest_recent_interval(connection):
@@ -134,7 +127,14 @@ def get_earliest_recent_interval(connection):
             """
         )
 
-        return cursor.fetchone()[0]
+        first_missing_interval = cursor.fetchone()[0]
+
+        if isinstance(first_missing_interval, str):
+            first_missing_interval = datetime.fromisoformat(
+                first_missing_interval
+            )
+
+        return first_missing_interval
 
         
 def get_recent_weather(connection):
@@ -327,6 +327,25 @@ def upsert_recent_weather(connection, rows):
             %s, %s, %s, %s, 'Recent'
         )
         ON DUPLICATE KEY UPDATE
+            LoadedAtUtc =
+                IF(
+                    WeatherDataType = 'Reanalysis',
+                    LoadedAtUtc,
+                    IF(
+                        NOT (
+                            TemperatureC <=> VALUES(TemperatureC)
+                            AND RelativeHumidityPct <=> VALUES(RelativeHumidityPct)
+                            AND PrecipitationMm <=> VALUES(PrecipitationMm)
+                            AND CloudCoverPct <=> VALUES(CloudCoverPct)
+                            AND WindSpeedKmh <=> VALUES(WindSpeedKmh)
+                            AND WindGustKmh <=> VALUES(WindGustKmh)
+                            AND ShortwaveRadiationWm2 <=> VALUES(ShortwaveRadiationWm2)
+                            AND DirectRadiationWm2 <=> VALUES(DirectRadiationWm2)
+                        ),
+                        UTC_TIMESTAMP(),
+                        LoadedAtUtc
+                    )
+                ),
             TemperatureC =
                 IF(WeatherDataType = 'Reanalysis',
                    TemperatureC, VALUES(TemperatureC)),
@@ -353,10 +372,7 @@ def upsert_recent_weather(connection, rows):
                    DirectRadiationWm2, VALUES(DirectRadiationWm2)),
             WeatherDataType =
                 IF(WeatherDataType = 'Reanalysis',
-                   'Reanalysis', 'Recent'),
-            LoadedAtUtc =
-                IF(WeatherDataType = 'Reanalysis',
-                   LoadedAtUtc, UTC_TIMESTAMP())
+                   'Reanalysis', 'Recent')
     """
 
     values = [
@@ -374,15 +390,29 @@ def upsert_recent_weather(connection, rows):
         for row in rows
     ]
 
+    rows_inserted = 0
+    rows_updated = 0
+    rows_unchanged = 0
+
     with connection.cursor() as cursor:
-        cursor.executemany(sql, values)
+        for value in values:
+            cursor.execute(sql, value)
+
+            if cursor.rowcount == 1:
+                rows_inserted += 1
+            elif cursor.rowcount == 2:
+                rows_updated += 1
+            else:
+                rows_unchanged += 1
 
     connection.commit()
+
+    return rows_inserted, rows_updated, rows_unchanged
 
 
 def upsert_reanalysis_weather(connection, rows):
     if not rows:
-        return
+        return 0, 0, 0
 
     sql = """
         INSERT INTO WeatherHourly
@@ -404,6 +434,22 @@ def upsert_reanalysis_weather(connection, rows):
             %s, %s, %s, %s, 'Reanalysis'
         )
         ON DUPLICATE KEY UPDATE
+            LoadedAtUtc =
+                IF(
+                    NOT (
+                        TemperatureC <=> VALUES(TemperatureC)
+                        AND RelativeHumidityPct <=> VALUES(RelativeHumidityPct)
+                        AND PrecipitationMm <=> VALUES(PrecipitationMm)
+                        AND CloudCoverPct <=> VALUES(CloudCoverPct)
+                        AND WindSpeedKmh <=> VALUES(WindSpeedKmh)
+                        AND WindGustKmh <=> VALUES(WindGustKmh)
+                        AND ShortwaveRadiationWm2 <=> VALUES(ShortwaveRadiationWm2)
+                        AND DirectRadiationWm2 <=> VALUES(DirectRadiationWm2)
+                        AND WeatherDataType = 'Reanalysis'
+                    ),
+                    UTC_TIMESTAMP(),
+                    LoadedAtUtc
+                ),
             TemperatureC = VALUES(TemperatureC),
             RelativeHumidityPct = VALUES(RelativeHumidityPct),
             PrecipitationMm = VALUES(PrecipitationMm),
@@ -412,8 +458,7 @@ def upsert_reanalysis_weather(connection, rows):
             WindGustKmh = VALUES(WindGustKmh),
             ShortwaveRadiationWm2 = VALUES(ShortwaveRadiationWm2),
             DirectRadiationWm2 = VALUES(DirectRadiationWm2),
-            WeatherDataType = 'Reanalysis',
-            LoadedAtUtc = UTC_TIMESTAMP()
+            WeatherDataType = 'Reanalysis'
     """
 
     values = [
@@ -431,20 +476,30 @@ def upsert_reanalysis_weather(connection, rows):
         for row in rows
     ]
 
+    rows_inserted = 0
+    rows_updated = 0
+    rows_unchanged = 0
+
     with connection.cursor() as cursor:
-        cursor.executemany(sql, values)
+        for value in values:
+            cursor.execute(sql, value)
+
+            if cursor.rowcount == 1:
+                rows_inserted += 1
+            elif cursor.rowcount == 2:
+                rows_updated += 1
+            else:
+                rows_unchanged += 1
 
     connection.commit()
+
+    return rows_inserted, rows_updated, rows_unchanged
 
 
 def main():
     connection = get_database_connection()
 
     load_run_key = None
-
-    first_missing_interval = get_first_missing_weather_interval(connection)
-
-    #print(f"First missing weather interval: {first_missing_interval}")
     
     try:
         with connection.cursor() as cursor:
@@ -457,54 +512,17 @@ def main():
 
         reanalysis_rows = build_reanalysis_rows(reanalysis_weather)
 
-        hourly = weather["hourly"]
-        times = hourly["time"]
-
-        current_hour_utc = datetime.now(timezone.utc).replace(
-            minute=0,
-            second=0,
-            microsecond=0,
-        )
-
-        completed_times = [
-            value
-            for value in times
-            if datetime.fromisoformat(value).replace(tzinfo=timezone.utc)
-            < current_hour_utc
-        ]
-
-        #print(f"Weather rows received: {len(times)}")
-        #print(f"Completed weather rows: {len(completed_times)}")
-        #print(f"First interval: {times[0]}")
-        #print(f"Last completed interval: {completed_times[-1]}")
-
-        #print()
-        #print("Units:")
-        #for name, unit in weather["hourly_units"].items():
-        #    print(f"  {name}: {unit}")
-
         rows = build_weather_rows(weather)
 
-        #print()
-        #print(f"Weather rows built: {len(rows)}")
-        #print("First row:")
-        #print(rows[0])
-        #print()
-        #print("Last row:")
-        #print(rows[-1])
-
-        with connection.cursor() as cursor:
-            cursor.execute("SELECT DATABASE()")
-            database_name = cursor.fetchone()[0]
-
-        #print()
-        #print(f"Database connection successful: {database_name}")
-
-        upsert_recent_weather(connection, rows)
+        recent_inserted, recent_updated, _ = (
+            upsert_recent_weather(connection, rows)
+        )
 
         print(f"Recent weather rows processed: {len(rows)}")
 
-        upsert_reanalysis_weather(connection, reanalysis_rows)
+        reanalysis_inserted, reanalysis_updated, _ = (
+            upsert_reanalysis_weather(connection, reanalysis_rows)
+        )
 
         print(f"Reanalysis weather rows processed: {len(reanalysis_rows)}")
 
@@ -513,8 +531,8 @@ def main():
                 cursor,
                 load_run_key,
                 len(rows) + len(reanalysis_rows),
-                0,
-                0,
+                recent_inserted + reanalysis_inserted,
+                recent_updated + reanalysis_updated,
             )
 
         connection.commit()
