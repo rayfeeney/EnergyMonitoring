@@ -1,3 +1,4 @@
+import argparse
 import asyncio
 import os
 from datetime import datetime, timedelta, timezone
@@ -13,6 +14,24 @@ def parse_utc(value: str) -> datetime:
     return datetime.fromisoformat(
         value.replace("Z", "+00:00")
     ).replace(tzinfo=None)
+
+
+def parse_arguments():
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument(
+        "--start-date",
+        type=lambda value: datetime.strptime(value, "%Y-%m-%d").date(),
+        help="First UTC date to backload (YYYY-MM-DD).",
+    )
+
+    parser.add_argument(
+        "--end-date",
+        type=lambda value: datetime.strptime(value, "%Y-%m-%d").date(),
+        help="Last UTC date to backload (YYYY-MM-DD).",
+    )
+
+    return parser.parse_args()
 
 
 def get_or_create_device(cursor, device_name: str, model: str, ip_address: str) -> int:
@@ -110,6 +129,36 @@ def complete_load_run(
 
 
 async def main():
+    args = parse_arguments()
+
+    if (args.start_date is None) != (args.end_date is None):
+        raise ValueError(
+            "--start-date and --end-date must be supplied together."
+        )
+
+    if (
+        args.start_date is not None
+        and args.end_date < args.start_date
+    ):
+        raise ValueError(
+            "--end-date cannot be before --start-date."
+        )
+
+    backload_mode = args.start_date is not None
+
+    if backload_mode:
+        backload_start_utc = datetime.combine(
+            args.start_date,
+            datetime.min.time(),
+            tzinfo=timezone.utc,
+        )
+
+        backload_end_utc = datetime.combine(
+            args.end_date + timedelta(days=1),
+            datetime.min.time(),
+            tzinfo=timezone.utc,
+        )
+
     load_dotenv()
 
     username = os.environ["TAPO_USERNAME"]
@@ -134,16 +183,58 @@ async def main():
 
         now = datetime.now(timezone.utc)
 
-        hourly_energy = await device.get_energy_data(
-            EnergyDataInterval.Hourly,
-            now,
-        )
+        if backload_mode:
+            hourly_entries = []
 
-        power_history = await device.get_power_data(
-            PowerDataInterval.Every5Minutes,
-            now - timedelta(hours=12),
-            now,
-        )
+            request_date = args.start_date - timedelta(days=1)
+            final_request_date = args.end_date + timedelta(days=1)
+
+            while request_date <= final_request_date:
+                hourly_energy = await device.get_energy_data(
+                    EnergyDataInterval.Hourly,
+                    request_date,
+                    request_date,
+                )
+
+                hourly_entries.extend(hourly_energy.entries)
+
+                request_date += timedelta(days=1)
+        else:
+            hourly_energy = await device.get_energy_data(
+                EnergyDataInterval.Hourly,
+                now,
+            )
+
+            hourly_entries = hourly_energy.entries
+
+        if backload_mode:
+            power_entries = []
+
+            chunk_start_utc = backload_start_utc
+
+            while chunk_start_utc < backload_end_utc:
+                chunk_end_utc = min(
+                    chunk_start_utc + timedelta(hours=12),
+                    backload_end_utc,
+                )
+
+                power_history = await device.get_power_data(
+                    PowerDataInterval.Every5Minutes,
+                    chunk_start_utc,
+                    chunk_end_utc,
+                )
+
+                power_entries.extend(power_history.entries)
+
+                chunk_start_utc = chunk_end_utc
+        else:
+            power_history = await device.get_power_data(
+                PowerDataInterval.Every5Minutes,
+                now - timedelta(hours=12),
+                now,
+            )
+
+            power_entries = power_history.entries
 
         current_hour_utc = now.replace(
             minute=0,
@@ -160,8 +251,8 @@ async def main():
         rows_unchanged = 0
 
         rows_received = (
-            len(hourly_energy.entries)
-            + len(power_history.entries)
+            len(hourly_entries)
+            + len(power_entries)
         )
 
         try:
@@ -182,12 +273,20 @@ async def main():
                     ip_address,
                 )
 
-                for entry in hourly_energy.entries:
+                for entry in hourly_entries:
                     row = entry.to_dict()
 
                     hour_start_utc = parse_utc(
                         row["start_date_time"]
                     )
+
+                    if backload_mode:
+                        if not (
+                            backload_start_utc.replace(tzinfo=None)
+                            <= hour_start_utc
+                            < backload_end_utc.replace(tzinfo=None)
+                        ):
+                            continue
 
                     # Only store completed hourly intervals.
                     if hour_start_utc >= current_hour_utc:
@@ -221,7 +320,7 @@ async def main():
                     else:
                         rows_unchanged += 1
 
-                for entry in power_history.entries:
+                for entry in power_entries:
                     row = entry.to_dict()
 
                     cursor.execute(
@@ -262,8 +361,8 @@ async def main():
 
             connection.commit()
 
-            print(f"Hourly energy rows received: {len(hourly_energy.entries)}")
-            print(f"5-minute power rows received: {len(power_history.entries)}")
+            print(f"Hourly energy rows received: {len(hourly_entries)}")
+            print(f"5-minute power rows received: {len(power_entries)}")
             print(f"Rows inserted: {rows_inserted}")
             print(f"Rows updated: {rows_updated}")
             print(f"Rows unchanged: {rows_unchanged}")
