@@ -1,0 +1,2 @@
+ALTER TABLE TapoPowerReading
+    MODIFY COLUMN PowerWatts INT NULL;
