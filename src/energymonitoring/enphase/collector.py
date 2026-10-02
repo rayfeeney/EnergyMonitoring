@@ -422,7 +422,11 @@ def main():
                 cursor,
                 "Enphase",
             )
-            
+
+            # Commit the LoadRun record separately so that it survives
+            # a rollback if the subsequent data load fails.
+            connection.commit()
+
             for end_at, values in combined_intervals.items():
                 interval_end_utc = datetime.fromtimestamp(
                     end_at,
