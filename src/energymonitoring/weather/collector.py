@@ -1,3 +1,4 @@
+import argparse
 import os
 from datetime import datetime, timedelta, timezone
 import pymysql
@@ -7,6 +8,24 @@ from dotenv import load_dotenv
 
 
 load_dotenv()
+
+
+def parse_arguments():
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument(
+        "--start-date",
+        type=lambda value: datetime.strptime(value, "%Y-%m-%d").date(),
+        help="First UTC date to backload (YYYY-MM-DD).",
+    )
+
+    parser.add_argument(
+        "--end-date",
+        type=lambda value: datetime.strptime(value, "%Y-%m-%d").date(),
+        help="Last UTC date to backload (YYYY-MM-DD).",
+    )
+
+    return parser.parse_args()
 
 
 OPEN_METEO_URL = "https://archive-api.open-meteo.com/v1/archive"
@@ -175,6 +194,30 @@ def get_recent_weather(connection):
     return response.json()
 
 
+def get_recent_weather_for_range(start_date, end_date):
+    latitude = float(os.environ["WEATHER_LATITUDE"])
+    longitude = float(os.environ["WEATHER_LONGITUDE"])
+
+    params = {
+        "latitude": latitude,
+        "longitude": longitude,
+        "start_date": start_date.isoformat(),
+        "end_date": end_date.isoformat(),
+        "hourly": ",".join(HOURLY_VARIABLES),
+        "timezone": "UTC",
+    }
+
+    response = requests.get(
+        OPEN_METEO_URL,
+        params=params,
+        timeout=30,
+    )
+
+    response.raise_for_status()
+
+    return response.json()
+
+
 def get_reanalysis_weather(connection):
     latitude = float(os.environ["WEATHER_LATITUDE"])
     longitude = float(os.environ["WEATHER_LONGITUDE"])
@@ -215,6 +258,31 @@ def get_reanalysis_weather(connection):
         params=params,
         timeout=30,
     )
+    response.raise_for_status()
+
+    return response.json()
+
+
+def get_reanalysis_weather_for_range(start_date, end_date):
+    latitude = float(os.environ["WEATHER_LATITUDE"])
+    longitude = float(os.environ["WEATHER_LONGITUDE"])
+
+    params = {
+        "latitude": latitude,
+        "longitude": longitude,
+        "start_date": start_date.isoformat(),
+        "end_date": end_date.isoformat(),
+        "hourly": ",".join(HOURLY_VARIABLES),
+        "timezone": "UTC",
+        "models": "era5_seamless",
+    }
+
+    response = requests.get(
+        OPEN_METEO_URL,
+        params=params,
+        timeout=30,
+    )
+
     response.raise_for_status()
 
     return response.json()
@@ -497,6 +565,23 @@ def upsert_reanalysis_weather(connection, rows):
 
 
 def main():
+    args = parse_arguments()
+
+    if (args.start_date is None) != (args.end_date is None):
+        raise ValueError(
+            "--start-date and --end-date must be supplied together."
+        )
+
+    if (
+        args.start_date is not None
+        and args.end_date < args.start_date
+    ):
+        raise ValueError(
+            "--end-date cannot be before --start-date."
+        )
+
+    backload_mode = args.start_date is not None
+
     connection = get_database_connection()
 
     load_run_key = None
@@ -507,8 +592,19 @@ def main():
 
         connection.commit()
 
-        weather = get_recent_weather(connection)
-        reanalysis_weather = get_reanalysis_weather(connection)
+        if backload_mode:
+            weather = get_recent_weather_for_range(
+                args.start_date,
+                args.end_date,
+            )
+
+            reanalysis_weather = get_reanalysis_weather_for_range(
+                args.start_date,
+                args.end_date,
+            )
+        else:
+            weather = get_recent_weather(connection)
+            reanalysis_weather = get_reanalysis_weather(connection)
 
         reanalysis_rows = build_reanalysis_rows(reanalysis_weather)
 
