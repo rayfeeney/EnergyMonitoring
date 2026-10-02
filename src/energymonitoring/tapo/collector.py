@@ -171,8 +171,12 @@ async def main():
                     f"Tapo:{device_info.nickname}",
                 )
 
+                # Commit the LoadRun record separately so that it survives
+                # a rollback if the subsequent data load fails.
+                connection.commit()
+
                 device_key = get_or_create_device(
-                    cursor,
+                                    cursor,
                     device_info.nickname,
                     device_info.model,
                     ip_address,
