@@ -1,0 +1,3 @@
+ALTER TABLE EnergyMonitoring.Tariff
+ADD COLUMN ExportEffectiveFromDate DATE NULL
+AFTER ExportRatePencePerKWh;
