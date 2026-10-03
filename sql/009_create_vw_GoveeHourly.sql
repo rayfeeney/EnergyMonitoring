@@ -27,7 +27,7 @@ SELECT
 FROM orchids.environmentreading
 
 WHERE NOT (
-    HOUR(readingDateTime) = 1
+    HOUR(readingDateTime) BETWEEN 0 AND 2
 
     AND TIMEDIFF(
         CONVERT_TZ(
